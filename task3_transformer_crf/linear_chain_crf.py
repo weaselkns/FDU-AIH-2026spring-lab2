@@ -47,10 +47,15 @@ class LinearChainCRF(nn.Module):
     viterbi_decode / batch_decode：供推理得到最优标签序列。
     """
 
-    def __init__(self, num_tags: int) -> None:
+    def __init__(
+        self,
+        num_tags: int,
+        transition_allow: torch.Tensor | None = None,
+    ) -> None:
         """
         参数：
             num_tags: 标签种类数 C（如 BIO/BMESO 展开后的标签表大小）。
+            transition_allow: 可选 (C, C) bool，True 表示允许的标签转移（用于 BIO 等硬约束）。
         """
         super().__init__()
         self.num_tags = num_tags
@@ -58,6 +63,18 @@ class LinearChainCRF(nn.Module):
         self.transitions = nn.Parameter(torch.randn(num_tags, num_tags) * 0.02)
         self.start_transitions = nn.Parameter(torch.randn(num_tags) * 0.02)
         self.end_transitions = nn.Parameter(torch.randn(num_tags) * 0.02)
+        if transition_allow is not None:
+            if transition_allow.shape != (num_tags, num_tags):
+                raise ValueError("transition_allow 须为 (num_tags, num_tags)")
+            self.register_buffer("transition_allow", transition_allow.bool())
+        else:
+            self.transition_allow = None
+
+    def _masked_transitions(self) -> torch.Tensor:
+        trans = self.transitions
+        if self.transition_allow is not None:
+            trans = trans.masked_fill(~self.transition_allow, -1e4)
+        return trans
 
     def _forward_partition(self, emissions: torch.Tensor) -> torch.Tensor:
         """
@@ -91,7 +108,7 @@ class LinearChainCRF(nn.Module):
         for t in range(1, seq_len):
             # prev[i, j] = α[t-1, i] + trans[i, j]，对 i 做 logsumexp 得到 α[t, j] 前的部分
             emit_t = emissions[t].unsqueeze(0)  # (1, C)，广播加到各 j
-            prev = alpha.unsqueeze(1) + self.transitions  # (C, C)
+            prev = alpha.unsqueeze(1) + self._masked_transitions()  # (C, C)
             alpha = torch.logsumexp(prev, dim=0) + emit_t.squeeze(0)
 
         return torch.logsumexp(alpha + self.end_transitions, dim=0)
@@ -116,23 +133,33 @@ class LinearChainCRF(nn.Module):
         if tags.numel() != seq_len:
             raise ValueError("tags 长度必须与 emissions 一致")
 
+        trans = self._masked_transitions()
         score = self.start_transitions[tags[0]] + emissions[0, tags[0]]
         for t in range(1, seq_len):
-            score = score + self.transitions[tags[t - 1], tags[t]] + emissions[t, tags[t]]
+            score = score + trans[tags[t - 1], tags[t]] + emissions[t, tags[t]]
         score = score + self.end_transitions[tags[-1]]
         return score
 
-    def neg_log_likelihood(self, emissions: torch.Tensor, tags: torch.Tensor) -> torch.Tensor:
+    def neg_log_likelihood(
+        self,
+        emissions: torch.Tensor,
+        tags: torch.Tensor,
+        tag_weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         单句负对数条件似然：
 
             NLL = -log P(y|x) = log Z(x) - score(x, y)
 
         对 emissions（由上游网络产生）与 CRF 自身参数均可反传。
+        tag_weights: 可选 (C,) 对金标路径上各位置标签权重求平均后缩放 NLL。
         """
         log_z = self._forward_partition(emissions)
         gold = self._score_sentence(emissions, tags)
-        return log_z - gold
+        nll = log_z - gold
+        if tag_weights is not None:
+            nll = nll * tag_weights[tags].mean().clamp(min=0.1)
+        return nll
 
     def viterbi_decode(self, emissions: torch.Tensor) -> list[int]:
         """
@@ -152,7 +179,7 @@ class LinearChainCRF(nn.Module):
 
         score[0] = self.start_transitions + emissions[0]
         for t in range(1, seq_len):
-            prev = score[t - 1].unsqueeze(1) + self.transitions
+            prev = score[t - 1].unsqueeze(1) + self._masked_transitions()
             best_val, best_idx = prev.max(dim=0)
             score[t] = best_val + emissions[t]
             back[t] = best_idx
@@ -171,6 +198,7 @@ class LinearChainCRF(nn.Module):
         emissions: torch.Tensor,
         tags: torch.Tensor,
         lengths: torch.Tensor,
+        tag_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         对一个 mini-batch 求 **平均** NLL。
@@ -192,7 +220,9 @@ class LinearChainCRF(nn.Module):
             L = int(lengths[b].item())
             if L <= 0:
                 continue
-            total = total + self.neg_log_likelihood(emissions[b, :L], tags[b, :L])
+            total = total + self.neg_log_likelihood(
+                emissions[b, :L], tags[b, :L], tag_weights=tag_weights
+            )
             count += 1
         if count == 0:
             return total

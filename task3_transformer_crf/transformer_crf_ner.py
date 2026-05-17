@@ -19,7 +19,7 @@
 cd <项目根目录>
 torchrun --standalone --nproc_per_node=4 \\
     task3_transformer_crf/transformer_crf_ner.py \\
-    --lang English --batch-size 64 --epochs 12 --save-dir task3_transformer_crf/checkpoints
+    --lang both --save-dir task3_transformer_crf/checkpoints
 
 单机单卡仍可直接 python ...（不初始化进程组）。
 """
@@ -30,6 +30,7 @@ import argparse
 import math
 import os
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -39,11 +40,14 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm
 
 # 支持 python task3_transformer_crf/transformer_crf_ner.py 直接运行时的同目录导入
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
+
+from sklearn import metrics
 
 from linear_chain_crf import LinearChainCRF
 
@@ -175,9 +179,27 @@ def write_predictions(
 
 PAD, UNK = "<pad>", "<unk>"
 
+SORTED_LABELS_ENG = [
+    "O", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC", "B-MISC", "I-MISC"
+]
+SORTED_LABELS_CHN = [
+    "O", "B-NAME", "M-NAME", "E-NAME", "S-NAME", "B-CONT", "M-CONT", "E-CONT", "S-CONT",
+    "B-EDU", "M-EDU", "E-EDU", "S-EDU", "B-TITLE", "M-TITLE", "E-TITLE", "S-TITLE",
+    "B-ORG", "M-ORG", "E-ORG", "S-ORG", "B-RACE", "M-RACE", "E-RACE", "S-RACE",
+    "B-PRO", "M-PRO", "E-PRO", "S-PRO", "B-LOC", "M-LOC", "E-LOC", "S-LOC",
+]
+
+
+def normalize_token(word: str, language: str) -> str:
+    """英文转小写，缓解词表稀疏与 UNK；中文保持原样。"""
+    if language == "English":
+        return word.lower()
+    return word
+
 
 def build_vocab_and_tags(
     sentences: list[list[tuple[str, str]]],
+    language: str,
 ) -> tuple[dict[str, int], list[str], dict[str, int], list[str]]:
     """
     从训练句构造 token->id（0 保留给 PAD，UNK 固定为 1）与 tag->id。
@@ -187,7 +209,7 @@ def build_vocab_and_tags(
     tag_set: set[str] = set()
     for s in sentences:
         for w, t in s:
-            tok_set.add(w)
+            tok_set.add(normalize_token(w, language))
             tag_set.add(t)
     tag_itos = sorted(tag_set)
     tag_stoi = {t: i for i, t in enumerate(tag_itos)}
@@ -196,6 +218,71 @@ def build_vocab_and_tags(
     tok_itos = [PAD, UNK] + sorted(tok_set)
     tok_stoi = {w: i for i, w in enumerate(tok_itos)}
     return tok_stoi, tok_itos, tag_stoi, tag_itos
+
+
+def _tag_entity_type(tag: str) -> str:
+    if tag == "O":
+        return "O"
+    if "-" in tag:
+        return tag.split("-", 1)[1]
+    return tag
+
+
+def build_bio_transition_allow(tag_itos: list[str]) -> torch.Tensor:
+    """英文 BIO：禁止 O→I-X、I-X→I-Y(X≠Y) 等非法转移。"""
+    c = len(tag_itos)
+    allow = torch.zeros(c, c, dtype=torch.bool)
+    for i, ti in enumerate(tag_itos):
+        for j, tj in enumerate(tag_itos):
+            if ti == "O":
+                allow[i, j] = tj == "O" or tj.startswith("B-")
+            elif ti.startswith("B-") or ti.startswith("I-"):
+                ei = _tag_entity_type(ti)
+                if tj == "O" or tj.startswith("B-"):
+                    allow[i, j] = True
+                elif tj.startswith("I-"):
+                    allow[i, j] = _tag_entity_type(tj) == ei
+                else:
+                    allow[i, j] = False
+            else:
+                allow[i, j] = True
+    return allow
+
+
+def use_bio_transition_mask(language: str, tag_itos: list[str]) -> bool:
+    return language == "English" and "O" in tag_itos and any(t.startswith("B-") for t in tag_itos)
+
+
+def compute_tag_weights(
+    sentences: list[list[tuple[str, str]]],
+    tag_itos: list[str],
+    o_label: str = "O",
+) -> torch.Tensor:
+    """实体标签加权，缓解 O 主导与 MISC 等少数类。"""
+    cnt: Counter[str] = Counter()
+    for s in sentences:
+        for _, t in s:
+            cnt[t] += 1
+    total = float(sum(cnt.values()) or 1.0)
+    weights: list[float] = []
+    for t in tag_itos:
+        n = float(cnt.get(t, 0))
+        if t == o_label:
+            weights.append(1.0)
+        else:
+            weights.append(min(4.0, math.sqrt(total / (n + 1.0))))
+    return torch.tensor(weights, dtype=torch.float32)
+
+
+def micro_f1_from_tag_lists(
+    language: str,
+    y_true: list[str],
+    y_pred: list[str],
+) -> float:
+    labels = (SORTED_LABELS_ENG if language == "English" else SORTED_LABELS_CHN)[1:]
+    return float(
+        metrics.f1_score(y_true, y_pred, labels=labels, average="micro", zero_division=0)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -246,13 +333,15 @@ class TransformerCRFNER(nn.Module):
         num_tags: int,
         d_model: int = 128,
         nhead: int = 4,
-        num_layers: int = 2,
+        num_layers: int = 3,
         dim_feedforward: int = 512,
         dropout: float = 0.1,
         max_len: int = 512,
+        transition_allow: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.d_model = d_model
+        self.num_tags = num_tags
         self.embed = nn.Embedding(vocab_size, d_model, padding_idx=0)
         self.pos = PositionalEncoding(d_model, max_len=max_len, dropout=dropout)
         enc_layer = nn.TransformerEncoderLayer(
@@ -265,8 +354,12 @@ class TransformerCRFNER(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
         self.proj = nn.Linear(d_model, num_tags)
-        self.crf = LinearChainCRF(num_tags)
+        self.crf = LinearChainCRF(num_tags, transition_allow=transition_allow)
+        self._tag_weights: torch.Tensor | None = None
         self._reset_parameters()
+
+    def set_tag_weights(self, weights: torch.Tensor | None) -> None:
+        self._tag_weights = weights
 
     def _reset_parameters(self) -> None:
         nn.init.xavier_uniform_(self.embed.weight[2:, :])  # 跳过 PAD/UNK 行可选
@@ -296,7 +389,9 @@ class TransformerCRFNER(nn.Module):
         # 线性层给出每个 (batch, 时间, 标签) 的分数，作为 CRF 的一元势
         emissions = self.proj(h)
         if tags is not None:
-            return self.crf.batch_neg_log_likelihood(emissions, tags, lengths)
+            return self.crf.batch_neg_log_likelihood(
+                emissions, tags, lengths, tag_weights=self._tag_weights
+            )
         return emissions
 
     def decode_best_tags(
@@ -331,11 +426,13 @@ class SentenceNERDataset(Dataset):
         tok_stoi: dict[str, int],
         tag_stoi: dict[str, int],
         max_len: int,
+        language: str,
     ) -> None:
         self.samples = sentences
         self.tok_stoi = tok_stoi
         self.tag_stoi = tag_stoi
         self.max_len = max_len
+        self.language = language
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -343,7 +440,7 @@ class SentenceNERDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[list[int], list[int], int]:
         sent = self.samples[idx]
         unk = self.tok_stoi["<unk>"]
-        ids = [self.tok_stoi.get(w, unk) for w, _ in sent]
+        ids = [self.tok_stoi.get(normalize_token(w, self.language), unk) for w, _ in sent]
         labs = [self.tag_stoi[t] for _, t in sent]
         L = len(ids)
         if L > self.max_len:
@@ -377,6 +474,109 @@ def collate_fn(batch: list[tuple[list[int], list[int], int]], pad_id: int = 0) -
 # 训练 / 验证集预测
 # ---------------------------------------------------------------------------
 
+def _encode_tokens(toks: list[str], tok_stoi: dict[str, int], language: str) -> list[int]:
+    unk = tok_stoi["<unk>"]
+    return [tok_stoi.get(normalize_token(w, language), unk) for w in toks]
+
+
+@torch.no_grad()
+def decode_sentences(
+    model: TransformerCRFNER,
+    sentences: list[list[str]],
+    tok_stoi: dict[str, int],
+    tag_itos: list[str],
+    tag_stoi: dict[str, int],
+    language: str,
+    device: torch.device,
+    max_len: int,
+    batch_size: int = 16,
+) -> list[list[str]]:
+    """对 token 列表批量维特比解码，返回标签字符串序列。"""
+    model.eval()
+    o_tag_idx = tag_stoi.get("O", 0)
+    pred_tag_strs: list[list[str]] = []
+    for start in range(0, len(sentences), batch_size):
+        chunk = sentences[start : start + batch_size]
+        max_t = min(max((len(s) for s in chunk), default=0), max_len)
+        if max_t == 0:
+            pred_tag_strs.extend([[] for _ in chunk])
+            continue
+        input_ids = torch.zeros(len(chunk), max_t, dtype=torch.long)
+        lengths = torch.zeros(len(chunk), dtype=torch.long)
+        for i, toks in enumerate(chunk):
+            ids = _encode_tokens(toks, tok_stoi, language)
+            L = min(len(ids), max_len)
+            lengths[i] = L
+            input_ids[i, :L] = torch.tensor(ids[:L], dtype=torch.long)
+        input_ids = input_ids.to(device)
+        lengths = lengths.to(device)
+        id_seqs = model.decode_best_tags(input_ids, lengths)
+        for toks, ids_pred, L in zip(chunk, id_seqs, lengths.tolist()):
+            L = int(L)
+            tags_str = [tag_itos[j] for j in ids_pred[:L]]
+            if len(tags_str) < len(toks):
+                tags_str.extend([tag_itos[o_tag_idx]] * (len(toks) - len(tags_str)))
+            pred_tag_strs.append(tags_str[: len(toks)])
+    return pred_tag_strs
+
+
+def eval_validation_micro_f1(
+    model: TransformerCRFNER,
+    val_path: Path,
+    val_tokens: list[list[str]],
+    gold_sents: list[list[tuple[str, str]]],
+    tok_stoi: dict[str, int],
+    tag_itos: list[str],
+    tag_stoi: dict[str, int],
+    language: str,
+    device: torch.device,
+    max_len: int,
+) -> float:
+    pred_tags = decode_sentences(
+        model, val_tokens, tok_stoi, tag_itos, tag_stoi, language, device, max_len
+    )
+    y_true: list[str] = []
+    y_pred: list[str] = []
+    for sent_gold, tags_p in zip(gold_sents, pred_tags):
+        for (_, tg), tp in zip(sent_gold, tags_p):
+            y_true.append(tg)
+            y_pred.append(tp)
+    return micro_f1_from_tag_lists(language, y_true, y_pred)
+
+
+def resolve_lang_hparams(language: str, args: argparse.Namespace) -> dict[str, Any]:
+    """按语言给出较稳的训练配置（可通过 --no-lang-tune 关闭）。"""
+    if getattr(args, "no_lang_tune", False):
+        return {
+            "max_len": args.max_len,
+            "d_model": args.d_model,
+            "nhead": args.nhead,
+            "num_layers": args.num_layers,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+        }
+    if language == "English":
+        return {
+            "max_len": args.max_len,
+            "d_model": 128,
+            "nhead": 4,
+            "num_layers": 3,
+            "epochs": max(args.epochs, 16),
+            "batch_size": min(args.batch_size, 64),
+            "lr": 2e-3 if args.lr == 1.5e-3 else args.lr,
+        }
+    return {
+        "max_len": args.max_len,
+        "d_model": 128,
+        "nhead": 4,
+        "num_layers": 2,
+        "epochs": max(args.epochs, 12),
+        "batch_size": args.batch_size,
+        "lr": 2e-3 if args.lr == 1.5e-3 else args.lr,
+    }
+
+
 def train_one_language(
     language: str,
     ner_root: Path,
@@ -385,8 +585,8 @@ def train_one_language(
     max_len: int = 256,
     d_model: int = 128,
     nhead: int = 4,
-    num_layers: int = 2,
-    epochs: int = 12,
+    num_layers: int = 3,
+    epochs: int = 16,
     batch_size: int = 32,
     lr: float = 2e-3,
     save_ckpt: Path | None = None,
@@ -396,6 +596,10 @@ def train_one_language(
     local_rank: int = 0,
     world_size: int = 1,
     num_workers: int = 0,
+    use_bio_mask: bool = True,
+    use_tag_weights: bool = True,
+    eval_each_epoch: bool = True,
+    eval_every: int = 500,
 ) -> tuple[Path, Path, dict[str, Any]]:
     """
     读训练语料 → 建词表/标签表 →（多卡时）按 rank 划分 DataLoader → Transformer+CRF 前向算 NLL → 反传更新 → 仅 rank 0 做验证解码与写盘，避免多进程同时写同一文件。
@@ -412,11 +616,18 @@ def train_one_language(
     if rank == 0:
         print(f"[{language}] 读训练: {train_path}")
     train_sents = read_tagged_corpus(train_path)
-    tok_stoi, tok_itos, tag_stoi, tag_itos = build_vocab_and_tags(train_sents)
+    val_gold = read_tagged_corpus(val_path)
+    tok_stoi, tok_itos, tag_stoi, tag_itos = build_vocab_and_tags(train_sents, language)
     num_tags = len(tag_itos)
     vocab_size = len(tok_itos)
 
-    ds = SentenceNERDataset(train_sents, tok_stoi, tag_stoi, max_len)
+    transition_allow = None
+    if use_bio_mask and use_bio_transition_mask(language, tag_itos):
+        transition_allow = build_bio_transition_allow(tag_itos)
+        if rank == 0:
+            print(f"[{language}] 启用 BIO 转移约束")
+
+    ds = SentenceNERDataset(train_sents, tok_stoi, tag_stoi, max_len, language)
     # 多卡：每进程一个 DistributedSampler，保证各 rank 看到的数据子集不重叠且并起来为全量
     sampler: DistributedSampler | None = None
     if use_ddp and world_size > 1:
@@ -442,9 +653,13 @@ def train_one_language(
         nhead=nhead,
         num_layers=num_layers,
         dim_feedforward=4 * d_model,
-        dropout=0.1,
+        dropout=0.15 if language == "English" else 0.1,
         max_len=max(512, max_len + 8),
+        transition_allow=transition_allow,
     ).to(device)
+    if use_tag_weights:
+        tw = compute_tag_weights(train_sents, tag_itos).to(device)
+        base.set_tag_weights(tw)
 
     if use_ddp and world_size > 1:
         model = DDP(
@@ -457,7 +672,22 @@ def train_one_language(
         model = base
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=epochs, eta_min=lr * 0.05
+    )
     raw = unwrap_model(model)
+
+    batches_per_epoch = len(dl)
+    if rank == 0:
+        print(
+            f"[{language}] 训练句数={len(ds)}  "
+            f"batches/epoch={batches_per_epoch}  "
+            f"epochs={epochs}  batch_size={batch_size}  lr={lr}"
+        )
+
+    val_tokens = read_tokens_only(val_path) if rank == 0 else []
+    best_f1 = -1.0
+    best_state: dict[str, Any] | None = None
 
     model.train()
     for ep in range(1, epochs + 1):
@@ -466,7 +696,16 @@ def train_one_language(
             sampler.set_epoch(ep)
         total_loss = 0.0
         n_batches = 0
-        for batch in dl:
+        batch_iter: Any = dl
+        if rank == 0:
+            batch_iter = tqdm(
+                dl,
+                desc=f"[{language}] train {ep}/{epochs}",
+                unit="batch",
+                dynamic_ncols=True,
+                leave=(ep == epochs),
+            )
+        for batch in batch_iter:
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             tags = batch["tags"].to(device, non_blocking=True)
             lengths = batch["lengths"].to(device, non_blocking=True)
@@ -477,9 +716,38 @@ def train_one_language(
             opt.step()
             total_loss += float(loss.item())
             n_batches += 1
+            if rank == 0 and isinstance(batch_iter, tqdm):
+                batch_iter.set_postfix(
+                    loss=f"{loss.item():.4f}",
+                    avg=f"{total_loss / n_batches:.4f}",
+                    refresh=False,
+                )
+        scheduler.step()
         # DDP：各卡只看到自己的 batch 平均 loss；这里仅 rank0 打印本卡均值作参考
         if rank == 0:
-            print(f"[{language}] epoch {ep}/{epochs}  mean_nll(local)={total_loss / max(n_batches, 1):.4f}")
+            msg = f"[{language}] epoch {ep}/{epochs}  mean_nll={total_loss / max(n_batches, 1):.4f}  lr={scheduler.get_last_lr()[0]:.2e}"
+            if eval_each_epoch and (ep % eval_every == 0 or ep == epochs):
+                f1 = eval_validation_micro_f1(
+                    raw,
+                    val_path,
+                    val_tokens,
+                    val_gold,
+                    tok_stoi,
+                    tag_itos,
+                    tag_stoi,
+                    language,
+                    device,
+                    max_len,
+                )
+                msg += f"  val_micro_f1={f1:.4f}"
+                if f1 > best_f1:
+                    best_f1 = f1
+                    best_state = {k: v.cpu().clone() for k, v in raw.state_dict().items()}
+            print(msg)
+
+    if rank == 0 and best_state is not None:
+        raw.load_state_dict(best_state)
+        print(f"[{language}] 已加载验证 F1 最优权重 (best_micro_f1={best_f1:.4f})")
 
     # 所有进程先结束训练步，再进入仅 rank0 的解码（其他 rank 在 barrier 等待）
     if use_ddp and world_size > 1:
@@ -496,45 +764,16 @@ def train_one_language(
         "num_layers": num_layers,
         "vocab_size": vocab_size,
         "num_tags": num_tags,
+        "normalize_lower": language == "English",
+        "use_bio_mask": transition_allow is not None,
+        "best_val_micro_f1": best_f1,
     }
 
     if rank == 0:
         print(f"[{language}] 解码验证集 -> {pred_path}")
-        val_tokens = read_tokens_only(val_path)
-        raw.eval()
-        pred_tag_strs: list[list[str]] = []
-        unk = tok_stoi["<unk>"]
-
-        def encode_sentence(toks: list[str]) -> list[int]:
-            return [tok_stoi.get(w, unk) for w in toks]
-
-        o_tag_idx = tag_stoi.get("O", 0)
-
-        bs = 16
-        with torch.no_grad():
-            for start in range(0, len(val_tokens), bs):
-                chunk = val_tokens[start : start + bs]
-                max_t = min(max((len(s) for s in chunk), default=0), max_len)
-                if max_t == 0:
-                    pred_tag_strs.extend([[] for _ in chunk])
-                    continue
-                input_ids = torch.zeros(len(chunk), max_t, dtype=torch.long)
-                lengths = torch.zeros(len(chunk), dtype=torch.long)
-                for i, toks in enumerate(chunk):
-                    ids = encode_sentence(toks)
-                    L = min(len(ids), max_len)
-                    lengths[i] = L
-                    input_ids[i, :L] = torch.tensor(ids[:L], dtype=torch.long)
-                input_ids = input_ids.to(device)
-                lengths = lengths.to(device)
-                id_seqs = raw.decode_best_tags(input_ids, lengths)
-                for toks, ids_pred, L in zip(chunk, id_seqs, lengths.tolist()):
-                    L = int(L)
-                    tags_str = [tag_itos[j] for j in ids_pred[:L]]
-                    if len(tags_str) < len(toks):
-                        tags_str.extend([tag_itos[o_tag_idx]] * (len(toks) - len(tags_str)))
-                    pred_tag_strs.append(tags_str[: len(toks)])
-
+        pred_tag_strs = decode_sentences(
+            raw, val_tokens, tok_stoi, tag_itos, tag_stoi, language, device, max_len
+        )
         write_predictions(pred_path, val_tokens, pred_tag_strs)
 
         if save_ckpt is not None:
@@ -582,10 +821,15 @@ def predict_with_checkpoint(
     except TypeError:
         ck = torch.load(ckpt_path, map_location=device)
     meta = ck["meta"]
+    language: str = meta.get("language", "English")
     tok_stoi: dict[str, int] = meta["tok_stoi"]
     tag_stoi: dict[str, int] = meta["tag_stoi"]
     tag_itos: list[str] = meta["tag_itos"]
     max_len = int(meta["max_len"])
+
+    transition_allow = None
+    if meta.get("use_bio_mask"):
+        transition_allow = build_bio_transition_allow(tag_itos)
 
     model = TransformerCRFNER(
         vocab_size=int(meta["vocab_size"]),
@@ -596,42 +840,13 @@ def predict_with_checkpoint(
         dim_feedforward=4 * int(meta["d_model"]),
         dropout=0.1,
         max_len=max(512, max_len + 8),
+        transition_allow=transition_allow,
     ).to(device)
     model.load_state_dict(ck["model_state"])
-    model.eval()
-
     sents = read_tokens_only(input_path)
-    unk = tok_stoi["<unk>"]
-    o_tag_idx = tag_stoi.get("O", 0)
-    pred_tags: list[list[str]] = []
-
-    def encode_sentence(toks: list[str]) -> list[int]:
-        return [tok_stoi.get(w, unk) for w in toks]
-
-    with torch.no_grad():
-        for start in range(0, len(sents), batch_size):
-            chunk = sents[start : start + batch_size]
-            max_t = min(max((len(s) for s in chunk), default=0), max_len)
-            if max_t == 0:
-                pred_tags.extend([[] for _ in chunk])
-                continue
-            input_ids = torch.zeros(len(chunk), max_t, dtype=torch.long)
-            lengths = torch.zeros(len(chunk), dtype=torch.long)
-            for i, toks in enumerate(chunk):
-                ids = encode_sentence(toks)
-                L = min(len(ids), max_len)
-                lengths[i] = L
-                input_ids[i, :L] = torch.tensor(ids[:L], dtype=torch.long)
-            input_ids = input_ids.to(device)
-            lengths = lengths.to(device)
-            id_seqs = model.decode_best_tags(input_ids, lengths)
-            for toks, ids_pred, L in zip(chunk, id_seqs, lengths.tolist()):
-                L = int(L)
-                tags_str = [tag_itos[j] for j in ids_pred[:L]]
-                if len(tags_str) < len(toks):
-                    tags_str.extend([tag_itos[o_tag_idx]] * (len(toks) - len(tags_str)))
-                pred_tags.append(tags_str[: len(toks)])
-
+    pred_tags = decode_sentences(
+        model, sents, tok_stoi, tag_itos, tag_stoi, language, device, max_len, batch_size
+    )
     write_predictions(output_path, sents, pred_tags)
     print(f"已写出: {output_path}")
 
@@ -641,23 +856,49 @@ def main() -> None:
         description="任务三：Transformer + 手写 CRF（支持 torchrun 多卡 DDP）"
     )
     parser.add_argument("--lang", choices=["English", "Chinese", "both"], default="both")
-    parser.add_argument("--epochs", type=int, default=12)
+    parser.add_argument("--epochs", type=int, default=16)
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=32,
+        default=64,
         help="每块 GPU 上的 batch（DDP 时全局等效约 batch_size×卡数）",
     )
     parser.add_argument("--lr", type=float, default=2e-3)
     parser.add_argument("--max-len", type=int, default=256)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--nhead", type=int, default=4)
-    parser.add_argument("--num-layers", type=int, default=2)
+    parser.add_argument("--num-layers", type=int, default=3)
     parser.add_argument(
         "--num-workers",
         type=int,
-        default=0,
+        default=4,
         help="DataLoader worker 数；Linux 多卡可试 2~4，Windows 建议 0",
+    )
+    parser.add_argument(
+        "--no-lang-tune",
+        action="store_true",
+        help="关闭按语言自动调整结构/epoch/batch（完全使用命令行参数）",
+    )
+    parser.add_argument(
+        "--no-bio-mask",
+        action="store_true",
+        help="英文也不使用 BIO 转移硬约束",
+    )
+    parser.add_argument(
+        "--no-tag-weights",
+        action="store_true",
+        help="关闭实体标签加权 NLL",
+    )
+    parser.add_argument(
+        "--no-epoch-eval",
+        action="store_true",
+        help="不在每个 epoch 末算验证 F1 / 保存最优权重",
+    )
+    parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=500,
+        help="每 N 个 epoch 做一次验证 F1（最后一轮总会验证；默认 500≈仅末轮验证）",
     )
     parser.add_argument(
         "--save-dir",
@@ -705,24 +946,31 @@ def main() -> None:
             if save_root is not None and rank == 0:
                 save_root.mkdir(parents=True, exist_ok=True)
                 ck = save_root / f"{lang}_transformer_crf.pt"
+            hp = resolve_lang_hparams(lang, args)
+            if rank == 0:
+                print(f"[{lang}] hparams: {hp}")
             pred_path, gold_path, _ = train_one_language(
                 language=lang,
                 ner_root=ner_root,
                 out_dir=out_dir,
                 device=device,
-                max_len=args.max_len,
-                d_model=args.d_model,
-                nhead=args.nhead,
-                num_layers=args.num_layers,
-                epochs=args.epochs,
-                batch_size=args.batch_size,
-                lr=args.lr,
+                max_len=hp["max_len"],
+                d_model=hp["d_model"],
+                nhead=hp["nhead"],
+                num_layers=hp["num_layers"],
+                epochs=hp["epochs"],
+                batch_size=hp["batch_size"],
+                lr=hp["lr"],
                 save_ckpt=ck,
                 use_ddp=use_ddp,
                 rank=rank,
                 local_rank=local_rank,
                 world_size=world_size,
                 num_workers=args.num_workers,
+                use_bio_mask=not args.no_bio_mask,
+                use_tag_weights=not args.no_tag_weights,
+                eval_each_epoch=not args.no_epoch_eval,
+                eval_every=max(1, args.eval_every),
             )
             if rank == 0:
                 print_check_hint(lang, gold_path, pred_path)
