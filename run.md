@@ -1,27 +1,21 @@
-# 默认已启用：英文小写、BIO 约束、标签加权、Cosine LR、按语言调参、按验证 F1 存最优权重
+# Task3 默认与历史最佳验证 F1 对齐：12 epoch、每卡 batch 64、每 epoch 验证并保存最优权重
+# 英文：128 维 / 3 层；中文：128 维 / 2 层；BIO 约束 + 小写 + 标签加权 + Cosine LR
 # 必须在项目根目录执行
 
 cd /mnt/data/kw/kns/FDU-AIH-2026spring-lab2
 
-# 推荐：英文单卡（lang_tune 默认 16 epoch）
-CUDA_VISIBLE_DEVICES=3 python task3_transformer_crf/transformer_crf_ner.py \
-  --lang English --batch-size 32 \
-  --save-dir task3_transformer_crf/checkpoints
-
-# 中文单卡（lang_tune 默认 12 epoch）
-CUDA_VISIBLE_DEVICES=4 python task3_transformer_crf/transformer_crf_ner.py \
-  --lang Chinese --batch-size 64 \
-  --save-dir task3_transformer_crf/checkpoints
-
-# 中英文顺序训练（单卡）
-CUDA_VISIBLE_DEVICES=3 python task3_transformer_crf/transformer_crf_ner.py \
-  --lang both --save-dir task3_transformer_crf/checkpoints
-
-# 四卡 DDP（默认 --eval-every 500：24 epoch 时只在第 24 轮验证一次，最快）
+# 四卡 DDP（不传参即默认：epochs=12, batch-size=64, eval-every=1）
 CUDA_VISIBLE_DEVICES=3,4,5,6 torchrun --standalone --nproc_per_node=4 \
-  task3_transformer_crf/transformer_crf_ner.py \
+  pj2/part3/transformer_crf_ner.py \
   --lang both --batch-size 64 --num-workers 4 \
-  --save-dir task3_transformer_crf/checkpoints
+  --save-dir pj2/part3/checkpoints
 
-# 想中途盯 F1：--eval-every 2 或 5
-# 完全不要验证、不要最优 checkpoint：--no-epoch-eval
+# 单卡中英文
+CUDA_VISIBLE_DEVICES=3 python pj2/part3/transformer_crf_ner.py \
+  --lang both --save-dir pj2/part3/checkpoints
+
+# 少做验证加快速度：--eval-every 3
+# 完全不做验证（不推荐）：--no-epoch-eval
+
+# Bonus：模板 CRF 中文 NER（CPU，约半分钟）
+# python pj2/bonus/train_template_crf_chinese.py

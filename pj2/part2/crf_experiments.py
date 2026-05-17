@@ -1,5 +1,7 @@
 """
 任务二 CRF 批量实验：扫描 L1/L2 正则，记录验证集 micro-F1 并出图。
+
+在仓库根目录执行：``python pj2/part2/crf_experiments.py``（依赖同级 ``NER/`` 数据）。
 """
 
 from __future__ import annotations
@@ -10,15 +12,18 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "pj2"))
+PJ2_ROOT = Path(__file__).resolve().parent.parent
+PART2 = Path(__file__).resolve().parent
+sys.path.insert(0, str(PJ2_ROOT))
+sys.path.insert(0, str(PART2))
 
-from pj2._eval_utils import micro_f1
-from task2_crf.crf_ner import ner_data_dir, train_and_decode_validation
+from _eval_utils import micro_f1
+from crf_ner import ner_data_dir, train_and_decode_validation
 
 FIG_DIR = Path(__file__).resolve().parent / "figures"
+RESULTS_DIR = Path(__file__).resolve().parent / "results"
 FIG_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 LANGUAGES = ["English", "Chinese"]
 C1_LIST = [0.0, 0.05, 0.08, 0.12, 0.2]
@@ -72,7 +77,7 @@ def main() -> None:
         c2_f1[lang] = np.array(f1_c2, dtype=np.float64)
 
     np.savez(
-        FIG_DIR / "crf_results.npz",
+        RESULTS_DIR / "crf_results.npz",
         c1_list=np.array(C1_LIST, dtype=np.float64),
         c2_list=np.array(C2_LIST, dtype=np.float64),
         English_c1_f1=c1_f1["English"],
@@ -131,7 +136,7 @@ def main() -> None:
     fig3.savefig(FIG_DIR / "crf_best_f1_bar.png", dpi=150)
     plt.close(fig3)
 
-    print(f"\n已保存: {FIG_DIR}/crf_results.npz 与 PNG 图")
+    print(f"\n已保存: {RESULTS_DIR}/crf_results.npz 与 {FIG_DIR}/*.png")
 
 
 if __name__ == "__main__":

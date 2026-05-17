@@ -18,6 +18,9 @@ task3_transformer_crf/checkpoints/
 
 # 模型/中间件通用后缀（防止误提交到子目录）
 *.pt
+# 报告打包：pj2/part3 内提交的 Transformer+CRF 权重复本需纳入版本库
+!pj2/part3/checkpoints/
+!pj2/part3/checkpoints/*.pt
 *.npz
 *.pkl
 

@@ -492,31 +492,36 @@ def decode_sentences(
     batch_size: int = 16,
 ) -> list[list[str]]:
     """对 token 列表批量维特比解码，返回标签字符串序列。"""
+    was_training = model.training
     model.eval()
     o_tag_idx = tag_stoi.get("O", 0)
     pred_tag_strs: list[list[str]] = []
-    for start in range(0, len(sentences), batch_size):
-        chunk = sentences[start : start + batch_size]
-        max_t = min(max((len(s) for s in chunk), default=0), max_len)
-        if max_t == 0:
-            pred_tag_strs.extend([[] for _ in chunk])
-            continue
-        input_ids = torch.zeros(len(chunk), max_t, dtype=torch.long)
-        lengths = torch.zeros(len(chunk), dtype=torch.long)
-        for i, toks in enumerate(chunk):
-            ids = _encode_tokens(toks, tok_stoi, language)
-            L = min(len(ids), max_len)
-            lengths[i] = L
-            input_ids[i, :L] = torch.tensor(ids[:L], dtype=torch.long)
-        input_ids = input_ids.to(device)
-        lengths = lengths.to(device)
-        id_seqs = model.decode_best_tags(input_ids, lengths)
-        for toks, ids_pred, L in zip(chunk, id_seqs, lengths.tolist()):
-            L = int(L)
-            tags_str = [tag_itos[j] for j in ids_pred[:L]]
-            if len(tags_str) < len(toks):
-                tags_str.extend([tag_itos[o_tag_idx]] * (len(toks) - len(tags_str)))
-            pred_tag_strs.append(tags_str[: len(toks)])
+    try:
+        for start in range(0, len(sentences), batch_size):
+            chunk = sentences[start : start + batch_size]
+            max_t = min(max((len(s) for s in chunk), default=0), max_len)
+            if max_t == 0:
+                pred_tag_strs.extend([[] for _ in chunk])
+                continue
+            input_ids = torch.zeros(len(chunk), max_t, dtype=torch.long)
+            lengths = torch.zeros(len(chunk), dtype=torch.long)
+            for i, toks in enumerate(chunk):
+                ids = _encode_tokens(toks, tok_stoi, language)
+                L = min(len(ids), max_len)
+                lengths[i] = L
+                input_ids[i, :L] = torch.tensor(ids[:L], dtype=torch.long)
+            input_ids = input_ids.to(device)
+            lengths = lengths.to(device)
+            id_seqs = model.decode_best_tags(input_ids, lengths)
+            for toks, ids_pred, L in zip(chunk, id_seqs, lengths.tolist()):
+                L = int(L)
+                tags_str = [tag_itos[j] for j in ids_pred[:L]]
+                if len(tags_str) < len(toks):
+                    tags_str.extend([tag_itos[o_tag_idx]] * (len(toks) - len(tags_str)))
+                pred_tag_strs.append(tags_str[: len(toks)])
+    finally:
+        if was_training:
+            model.train()
     return pred_tag_strs
 
 
@@ -562,7 +567,8 @@ def resolve_lang_hparams(language: str, args: argparse.Namespace) -> dict[str, A
             "d_model": 128,
             "nhead": 4,
             "num_layers": 3,
-            "epochs": max(args.epochs, 16),
+            # 与历史最佳验证 F1 对齐：12 epoch、每卡 batch≤64
+            "epochs": max(args.epochs, 12),
             "batch_size": min(args.batch_size, 64),
             "lr": 2e-3 if args.lr == 1.5e-3 else args.lr,
         }
@@ -586,8 +592,8 @@ def train_one_language(
     d_model: int = 128,
     nhead: int = 4,
     num_layers: int = 3,
-    epochs: int = 16,
-    batch_size: int = 32,
+    epochs: int = 12,
+    batch_size: int = 64,
     lr: float = 2e-3,
     save_ckpt: Path | None = None,
     *,
@@ -599,7 +605,7 @@ def train_one_language(
     use_bio_mask: bool = True,
     use_tag_weights: bool = True,
     eval_each_epoch: bool = True,
-    eval_every: int = 500,
+    eval_every: int = 1,
 ) -> tuple[Path, Path, dict[str, Any]]:
     """
     读训练语料 → 建词表/标签表 →（多卡时）按 rank 划分 DataLoader → Transformer+CRF 前向算 NLL → 反传更新 → 仅 rank 0 做验证解码与写盘，避免多进程同时写同一文件。
@@ -744,6 +750,8 @@ def train_one_language(
                     best_f1 = f1
                     best_state = {k: v.cpu().clone() for k, v in raw.state_dict().items()}
             print(msg)
+        # decode_sentences 会 eval；DDP 下务必恢复 train，否则各卡行为不一致
+        model.train()
 
     if rank == 0 and best_state is not None:
         raw.load_state_dict(best_state)
@@ -856,7 +864,7 @@ def main() -> None:
         description="任务三：Transformer + 手写 CRF（支持 torchrun 多卡 DDP）"
     )
     parser.add_argument("--lang", choices=["English", "Chinese", "both"], default="both")
-    parser.add_argument("--epochs", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument(
         "--batch-size",
         type=int,
@@ -897,8 +905,8 @@ def main() -> None:
     parser.add_argument(
         "--eval-every",
         type=int,
-        default=500,
-        help="每 N 个 epoch 做一次验证 F1（最后一轮总会验证；默认 500≈仅末轮验证）",
+        default=1,
+        help="每 N 个 epoch 做一次验证 F1 并更新最优权重（最后一轮总会验证）",
     )
     parser.add_argument(
         "--save-dir",

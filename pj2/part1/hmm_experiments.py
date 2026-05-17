@@ -1,5 +1,7 @@
 """
 任务一 HMM 批量实验：扫描发射平滑强度 emit_smoothing，记录验证集 micro-F1 并出图。
+
+在仓库根目录执行：``python pj2/part1/hmm_experiments.py``（依赖同级 ``NER/`` 数据）。
 """
 
 from __future__ import annotations
@@ -10,15 +12,18 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "pj2"))
+PJ2_ROOT = Path(__file__).resolve().parent.parent
+PART1 = Path(__file__).resolve().parent
+sys.path.insert(0, str(PJ2_ROOT))
+sys.path.insert(0, str(PART1))
 
-from pj2._eval_utils import micro_f1
-from task1_hmm.hmm_ner import ner_data_dir, train_and_decode_validation
+from _eval_utils import micro_f1
+from hmm_ner import ner_data_dir, train_and_decode_validation
 
 FIG_DIR = Path(__file__).resolve().parent / "figures"
+RESULTS_DIR = Path(__file__).resolve().parent / "results"
 FIG_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 EMIT_SMOOTHINGS = [1e-4, 1e-3, 1e-2, 5e-2, 1e-1]
 LANGUAGES = ["English", "Chinese"]
@@ -49,7 +54,7 @@ def main() -> None:
         results[f"{lang}_f1"] = np.array(f1_list, dtype=np.float64)
 
     np.savez(
-        FIG_DIR / "hmm_results.npz",
+        RESULTS_DIR / "hmm_results.npz",
         emit_smoothings=np.array(EMIT_SMOOTHINGS, dtype=np.float64),
         **results,
     )
@@ -88,7 +93,7 @@ def main() -> None:
     fig2.tight_layout()
     fig2.savefig(FIG_DIR / "hmm_emit_smoothing_heatmap.png", dpi=150)
     plt.close(fig2)
-    print(f"\n已保存: {FIG_DIR}/hmm_results.npz 与 PNG 图")
+    print(f"\n已保存: {RESULTS_DIR}/hmm_results.npz 与 {FIG_DIR}/*.png")
 
 
 if __name__ == "__main__":
