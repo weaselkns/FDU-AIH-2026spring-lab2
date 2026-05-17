@@ -1,1 +1,38 @@
+# 课程压缩包（解压后使用 NER/ 即可，一般不必提交 rar）
 NER.rar
+
+# 参考旧项目，不纳入版本控制（若需提交可删除此行）
+pj1/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+.venv/
+env/
+
+# ---- 运行生成物（体积大、可再跑脚本生成；服务器跑完用 scp/rsync 拉回本地）----
+NER/predictions/
+task1_hmm/models/
+task2_crf/models/
+task3_transformer_crf/checkpoints/
+
+# 模型/中间件通用后缀（防止误提交到子目录）
+*.pt
+*.npz
+*.pkl
+
+# ---- IDE / 系统 ----
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 日志
+*.log

@@ -1,0 +1,7 @@
+# 任务一 HMM：numpy
+# 任务二 CRF：sklearn-crfsuite + scikit-learn
+# 任务三 Transformer+手写 CRF：torch（多卡需 torchrun + NCCL）
+numpy>=1.20
+scikit-learn>=1.0
+sklearn-crfsuite>=0.3.6
+torch>=2.0
