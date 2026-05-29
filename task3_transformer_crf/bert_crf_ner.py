@@ -1,22 +1,10 @@
 """
-BERT + 手写线性链 CRF 的 NER（可选实验）
+BERT + 手写线性链 CRF 的 NER
 
 与 transformer_crf_ner.py 的区别：
 - 编码器换为 HuggingFace 预训练 BERT（英文 bert-base-cased，中文 bert-base-chinese）
 - CRF 仍使用同目录 linear_chain_crf.py（手写、可端到端反传）
-- 标签对齐：每个原词/字取 BERT 子词序列的**首子词** hidden，再在词级序列上跑 CRF
-
-依赖：pip install transformers
-
-示例（项目根目录）：
-  python task3_transformer_crf/bert_crf_ner.py --lang Chinese --epochs 5 --batch-size 8
-  python task3_transformer_crf/bert_crf_ner.py --lang English --save-dir task3_transformer_crf/checkpoints_bert
-
-仅解码：
-  python task3_transformer_crf/bert_crf_ner.py \\
-    --ckpt-path task3_transformer_crf/checkpoints_bert/English_bert_crf.pt \\
-    --input-path NER/English/validation.txt \\
-    --output-path NER/predictions/transformer_crf/English_validation_bert_crf.txt
+- 标签对齐：每个原词/字取 BERT 子词序列的首子词 hidden，再在词级序列上跑 CRF
 """
 
 from __future__ import annotations

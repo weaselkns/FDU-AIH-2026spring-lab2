@@ -1,25 +1,24 @@
 """
 一键面试评测（项目根目录执行）
 
-目录约定（把老师发的数据解压到根目录 test/ 即可）::
+测试数据目录（--test-root，默认自动选）::
 
-    test/English/test.txt
-    test/Chinese/test.txt
+    pj2_test/english_test.txt   # 扁平命名（本仓库彩排）
+    pj2_test/chinese_test.txt
 
-预测写在根目录（与 test 同级）::
+    或 test/English/test.txt、test/Chinese/test.txt
 
-    English_pred_task1.txt
-    English_pred_task2.txt
-    English_pred_task3.txt
-    Chinese_pred_task1.txt
-    ...
+预测写在根目录::
 
-有标签时用 test 当 gold，自动调用 NER/check.py 打分。
-无标签（面试真 test）时:  python run_test_eval.py --no-score
+    English_pred_task1.txt  ...  English_pred_bert.txt
+    Chinese_pred_task1.txt ...
 
-其它命令:
-  python run_test_eval.py --tasks 3          # 只跑 Task3
-  python run_test_eval.py --train-missing    # 缺 HMM/CRF 权重时先训练
+有标签时自动用输入文件当 gold 调 NER/check.py；无标签: --no-score
+
+常用命令见文件末尾 main 的 epilog；pj2_test 彩排示例::
+
+  python run_test_eval.py --test-root pj2_test
+  python run_test_eval.py --test-root pj2_test --tasks 4 --batch-size 32
 """
 
 from __future__ import annotations
@@ -33,11 +32,23 @@ from pathlib import Path
 warnings.filterwarnings("ignore")
 
 REPO_ROOT = Path(__file__).resolve().parent
-TEST_ROOT = REPO_ROOT / "test"
 NER_ROOT = REPO_ROOT / "NER"
 
 LANGS = ("English", "Chinese")
-TASK_SUFFIX = {1: "task1", 2: "task2", 3: "task3"}
+TASK_SUFFIX = {1: "task1", 2: "task2", 3: "task3", 4: "bert"}
+
+# pj2_test 扁平文件：english_test.txt / chinese_test.txt
+_PJ2_TEST_FLAT = {
+    "English": "english_test.txt",
+    "Chinese": "chinese_test.txt",
+}
+
+
+def _default_test_root() -> Path:
+    pj2 = REPO_ROOT / "pj2_test"
+    if pj2.is_dir() and any(pj2.glob("*_test.txt")):
+        return pj2
+    return REPO_ROOT / "test"
 
 
 def _load(name: str, path: Path):
@@ -49,15 +60,18 @@ def _load(name: str, path: Path):
     return mod
 
 
-def _find_test_file(lang: str) -> Path:
+def _find_test_file(test_root: Path, lang: str) -> Path:
+    flat = test_root / _PJ2_TEST_FLAT[lang]
+    if flat.is_file():
+        return flat
     for name in ("test.txt", "validation.txt"):
-        p = TEST_ROOT / lang / name
+        p = test_root / lang / name
         if p.is_file():
             return p
     raise FileNotFoundError(
-        f"请把测试数据放在:\n"
-        f"  {TEST_ROOT / lang / 'test.txt'}\n"
-        f"（或 {TEST_ROOT / lang / 'validation.txt'} 用于本地彩排）"
+        f"未找到 {lang} 测试数据，请任选一种布局:\n"
+        f"  {test_root / _PJ2_TEST_FLAT[lang]}\n"
+        f"  {test_root / lang / 'test.txt'}"
     )
 
 
@@ -75,6 +89,28 @@ def _resolve_t3_ckpt(lang: str) -> Path:
     raise FileNotFoundError(f"未找到 Task3 权重: {lang}_transformer_crf.pt（请先训练 Part3）")
 
 
+def _resolve_bert_ckpt(lang: str) -> Path:
+    p = REPO_ROOT / "task3_transformer_crf" / "checkpoints_bert" / f"{lang}_bert_crf.pt"
+    if p.is_file():
+        return p
+    raise FileNotFoundError(
+        f"未找到 BERT 权重: {p}\n"
+        f"请先训练: python task3_transformer_crf/bert_crf_ner.py --lang {lang} "
+        f"--save-dir task3_transformer_crf/checkpoints_bert"
+    )
+
+
+def _parse_tasks(s: str) -> set[int]:
+    if s in ("all", "1234"):
+        return {1, 2, 3, 4}
+    if s in ("123", "all3"):
+        return {1, 2, 3}
+    out = {int(c) for c in s.replace(",", "") if c in "1234"}
+    if not out:
+        raise ValueError("--tasks 应为 all / 1234 / 或 1,2,3,4 的组合")
+    return out
+
+
 def _run_check(language: str, gold: Path, pred: Path) -> None:
     check = _load("ner_check", NER_ROOT / "check.py")
     print(f"\n{'=' * 60}")
@@ -84,14 +120,37 @@ def _run_check(language: str, gold: Path, pred: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="test/ 一键推理 + 根目录写预测 + check.py")
-    parser.add_argument("--tasks", default="all", help="all 或 1,2,3")
+    parser = argparse.ArgumentParser(
+        description="一键推理 + 根目录写预测 + check.py",
+        epilog=(
+            "示例:\n"
+            "  python run_test_eval.py --test-root pj2_test\n"
+            "  python run_test_eval.py --test-root pj2_test --tasks 4 --device cuda\n"
+            "  python run_test_eval.py --test-root test --no-score\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--tasks", default="all", help="all(含BERT)=1234，或 1,2,3,4")
+    parser.add_argument(
+        "--test-root",
+        type=str,
+        default="",
+        help="测试数据目录，默认: 有 pj2_test/*_test.txt 则用 pj2_test，否则 test/",
+    )
     parser.add_argument("--no-score", action="store_true", help="测试集无标签，只出预测")
     parser.add_argument("--train-missing", action="store_true", help="缺 HMM/CRF 时先训练")
-    parser.add_argument("--device", default="", help="Task3: cuda / cpu")
+    parser.add_argument("--device", default="", help="Task3/BERT: cuda / cpu")
+    parser.add_argument("--batch-size", type=int, default=16, help="Task3/BERT 推理 batch")
     args = parser.parse_args()
 
-    tasks = {1, 2, 3} if args.tasks in ("all", "123") else {int(c) for c in args.tasks if c in "123"}
+    test_root = Path(args.test_root) if args.test_root else _default_test_root()
+    if not test_root.is_absolute():
+        test_root = REPO_ROOT / test_root
+    if not test_root.is_dir():
+        raise SystemExit(f"测试目录不存在: {test_root}")
+
+    tasks = _parse_tasks(args.tasks)
+    print(f"测试目录: {test_root}")
 
     hmm_dir = REPO_ROOT / "task1_hmm" / "models"
     crf_dir = REPO_ROOT / "task2_crf" / "models"
@@ -118,8 +177,8 @@ def main() -> None:
     import torch
 
     for lang in LANGS:
-        test_path = _find_test_file(lang)
-        print(f"\n>>> {lang}  输入: {test_path}")
+        test_path = _find_test_file(test_root, lang)
+        print(f"\n>>> {lang}  输入: {test_path.relative_to(REPO_ROOT)}")
 
         if 1 in tasks:
             hmm = _load("hmm_ner", REPO_ROOT / "task1_hmm" / "hmm_ner.py")
@@ -143,7 +202,22 @@ def main() -> None:
             t3 = _load("t3", REPO_ROOT / "task3_transformer_crf" / "transformer_crf_ner.py")
             out = _pred_path(lang, 3)
             dev = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-            t3.predict_with_checkpoint(_resolve_t3_ckpt(lang), test_path, out, dev)
+            print(f"    Task3 小 Transformer  ckpt={_resolve_t3_ckpt(lang).name}  device={dev}")
+            t3.predict_with_checkpoint(
+                _resolve_t3_ckpt(lang), test_path, out, dev, batch_size=args.batch_size
+            )
+            print(f"    写出 {out.name}")
+
+        if 4 in tasks:
+            bert = _load("bert_ner", REPO_ROOT / "task3_transformer_crf" / "bert_crf_ner.py")
+            out = _pred_path(lang, 4)
+            dev = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+            ckpt = _resolve_bert_ckpt(lang)
+            print(f"    Task4 BERT+CRF  ckpt={ckpt.name}  device={dev}  (仅 predict，不训练)")
+            bert.predict_with_checkpoint(
+                ckpt, test_path, out, dev, batch_size=args.batch_size
+            )
+            print(f"    写出 {out.name}")
 
         if not args.no_score:
             for tid in sorted(tasks):
