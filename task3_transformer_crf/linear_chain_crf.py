@@ -201,7 +201,7 @@ class LinearChainCRF(nn.Module):
         tag_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        对一个 mini-batch 求 **平均** NLL。
+        对一个 mini-batch 求平均 NLL。
 
         每条样本只取 [:L] 有效长度（L = lengths[b]），padding 段不参与
         CRF；这与 Transformer 侧 ``src_key_padding_mask`` 的语义一致。

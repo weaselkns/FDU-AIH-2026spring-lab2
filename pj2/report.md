@@ -218,8 +218,6 @@ python -c "from check import check; check(language='Chinese', gold_path=r'Chines
 3. **Transformer+手写 CRF** 在中文上验证了端到端训练可行性；英文在验证选优后可达约 **0.60**，继续提升仍依赖更小 batch、早停或预训练编码器。Part 1/2 已通过批量实验给出超参曲线；Part 3 以单次完整训练记录为主。
 4. **Bonus**：在仅使用 `template_for_crf.utf8` 的 20 组观测模板、不加 Part 2 手工特征的前提下，中文验证 **micro-F1≈0.951**，说明课堂分词式字窗模板对 **BMESO 中文 NER** 同样有效。
 
----
-
 ## 附录：复现实验命令
 
 ```bash

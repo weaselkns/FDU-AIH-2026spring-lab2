@@ -12,9 +12,24 @@ env/
 
 # ---- 运行生成物（体积大、可再跑脚本生成；服务器跑完用 scp/rsync 拉回本地）----
 NER/predictions/
+_eval_preds/
 task1_hmm/models/
 task2_crf/models/
 task3_transformer_crf/checkpoints/
+task3_transformer_crf/checkpoints_bert/
+
+# 根目录面试/本地一键评测输出
+*_pred_task*.txt
+English_pred_*.txt
+Chinese_pred_*.txt
+
+# 本地 test 目录：仅保留说明，不提交从 validation 复制的 test.txt
+test/**/test.txt
+
+# HuggingFace / 误生成的缓存目录（Windows 下 %CD% 未展开时会出现）
+.cache/
+%CD%/
+.huggingface/
 
 # 模型/中间件通用后缀（防止误提交到子目录）
 *.pt
@@ -23,6 +38,10 @@ task3_transformer_crf/checkpoints/
 !pj2/part3/checkpoints/*.pt
 *.npz
 *.pkl
+
+# 提交包、大文件
+*.zip
+pj2/report.pdf
 
 # ---- IDE / 系统 ----
 .idea/
