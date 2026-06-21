@@ -2,9 +2,9 @@
 
 孔恩燊　23307130021　2026.5
 
-本报告对应 **Project 2：命名实体识别（NER）**，实现并评测三条序列标注路线：**手写 HMM**、**线性链 CRF（sklearn-crfsuite + 手工特征）**、**Transformer 编码器 + 手写线性链 CRF**。数据为课程提供的 `NER/English` 与 `NER/Chinese`；指标统一为 `NER/check.py` 输出的 **实体级 micro-F1**（`labels` 不含 `O`）。
+本报告对应 **Project 2：命名实体识别（NER）**，实现并评测三条序列标注路线：**手写 HMM**、**线性链 CRF（sklearn-crfsuite + 手工特征）**、**Transformer 编码器 + 手写线性链 CRF**；并在 Part 3 之外补充 **BERT 预训练编码器 + 同一套手写 CRF** 的可选扩展。数据为课程提供的 `NER/English` 与 `NER/Chinese`；指标统一为 `NER/check.py` 输出的 **实体级 micro-F1**（`labels` 不含 `O`）。
 
-批量对比实验脚本产出：**图**在 `part1/`、`part2/` 的 `figures/` 下，**数值结果**（`.npz`）在对应 `results/` 下。Part 3 无 Part 1/2 式超参网格；**提交用权重复本**在 `part3/checkpoints/`。三条路线的实现均在 `part*/`（与仓库根目录 `task*_` 为同源副本，便于单独打包）；目录说明见 **`README.md`**，`part3/README.md` 为 Part 3 解码说明。
+批量对比实验脚本产出：**图**在 `part1/`、`part2/` 的 `figures/` 下，**数值结果**（`.npz`）在对应 `results/` 下。Part 3 无 Part 1/2 式超参网格；**提交用权重复本**在 `part3/checkpoints/`（小 Transformer）与仓库根目录 `task3_transformer_crf/checkpoints_bert/`（BERT+CRF）。Part 1/2/3 的实现均在 `part*/`（与仓库根目录 `task*_` 为同源副本，便于单独打包）；BERT 扩展代码见 `task3_transformer_crf/bert_crf_ner.py`，与 `part3/linear_chain_crf.py` 共用同一 CRF 层设计。目录说明见 **`README.md`**，`part3/README.md` 为 Part 3 解码说明。
 
 ## Part 1：手写 HMM 实现 NER
 
@@ -178,7 +178,87 @@ python -c "from check import check; check(language='Chinese', gold_path=r'Chines
 
 - **中文 0.803**：无预训练小 Transformer 下主类型表现仍较好；与此前末轮权重的 **0.826** 相比略低，属不同 checkpoint 与训练轨迹的正常方差，整体仍明显低于 Part 2 CRF（≈0.95）。
 - **英文 0.605**：仍低于 Part 1 HMM（≈0.79）与 Part 2 CRF（≈0.89），最优出现在 **第 2 个 epoch**，说明后续训练对验证集泛化未必有益，可能需早停、更小有效 batch 或更强正则/预训练。
-- 改进方向：英文可试更小 per-GPU batch、显式 early stopping；或接入预训练编码器以逼近 CRF 上限。
+- 改进方向：英文可试更小 per-GPU batch、显式 early stopping；或接入预训练编码器以逼近 CRF 上限（见下文 Part 4 BERT+CRF）。
+
+## Part 4：BERT + 手写 CRF（可选扩展）
+
+### 4.1 动机与结构
+
+Part 3 的小 Transformer 从零学习词表示，英文验证 F1 明显低于 Part 2 CRF。作为对照实验，在 **不改变 CRF 解码头** 的前提下，将编码器替换为 HuggingFace 预训练 BERT，检验 **预训练表示 + 结构化输出** 能否弥补表示瓶颈。
+
+流水线：
+
+\[
+\text{BERT} \rightarrow \text{词级 hidden（首子词对齐）} \rightarrow \text{Linear} \rightarrow \text{LinearChainCRF}
+\]
+
+与 Part 3 的相同点：**CRF 仍用手写 `LinearChainCRF`**（前向算 NLL、维特比解码、英文 BIO 转移硬约束、实体标签加权 NLL）。不同点：
+
+| 模块 | Part 3 小 Transformer | Part 4 BERT+CRF |
+|------|----------------------|-----------------|
+| 编码器 | 随机初始化 Embedding + TransformerEncoder | `bert-base-cased` / `bert-base-chinese` |
+| 对齐 | 词 = token | 词 = BERT 子词序列的 **首子词** hidden |
+| 优化 | 统一 AdamW，`lr≈2e-3` | 分组 AdamW：BERT `2e-5`，CRF+分类头 `×5` |
+| 依赖 | 仅 `torch` | 额外 `transformers` |
+
+主要代码：`task3_transformer_crf/bert_crf_ner.py`（与 `part3/linear_chain_crf.py` 同目录下的 CRF 实现一致，仓库根目录 `task3_transformer_crf/` 与 `pj2/part3/` 为同源副本关系）。
+
+### 4.2 训练配置与命令
+
+单卡训练（默认 5 epoch，每 epoch 在验证集上算 micro-F1 并保存最优权重）：
+
+```bash
+# 英文
+CUDA_VISIBLE_DEVICES=0 python task3_transformer_crf/bert_crf_ner.py \
+  --lang English --epochs 5 --batch-size 8 \
+  --save-dir task3_transformer_crf/checkpoints_bert
+
+# 中文
+CUDA_VISIBLE_DEVICES=0 python task3_transformer_crf/bert_crf_ner.py \
+  --lang Chinese --epochs 5 --batch-size 8 \
+  --save-dir task3_transformer_crf/checkpoints_bert
+```
+
+| 语言 | 预训练模型 | `max_words` | `max_bert_len` | batch | `lr` | 其他 |
+|------|------------|-------------|----------------|-------|------|------|
+| English | `bert-base-cased` | 128 | 256 | 8 | `2e-5` | BIO 转移约束、标签加权 |
+| Chinese | `bert-base-chinese` | 128 | 256 | 8 | `2e-5` | 标签加权 |
+
+权重复本：`task3_transformer_crf/checkpoints_bert/{English|Chinese}_bert_crf.pt`。  
+**说明**：checkpoint 保存微调后的 CRF/分类头/BERT 权重；推理时仍须从本地 HF 缓存加载同架构 BERT 骨架（实现中优先离线读 `~/.cache/huggingface` 快照，避免计算节点无外网）。
+
+### 4.3 验证集 micro-F1（`check.py`）
+
+在验证集最优权重上解码，预测文件：`NER/predictions/bert_crf/{English|Chinese}_validation_bert_crf.txt`。
+
+| 语言 | Precision | Recall | **micro-F1** |
+|------|-----------|--------|--------------|
+| English | 0.940 | 0.918 | **0.929** |
+| Chinese | 0.971 | 0.976 | **0.973** |
+
+```bash
+cd NER
+python -c "from check import check; check(language='English', gold_path=r'English/validation.txt', my_path=r'predictions/bert_crf/English_validation_bert_crf.txt')"
+python -c "from check import check; check(language='Chinese', gold_path=r'Chinese/validation.txt', my_path=r'predictions/bert_crf/Chinese_validation_bert_crf.txt')"
+```
+
+**分析**：
+
+- **英文 0.929**：相较 Part 3 小 Transformer（**0.605**）提升约 **32** 个百分点，并超过 Part 2 CRF（≈**0.89**）与 Part 1 HMM（≈**0.79**），说明预训练上下文表示对英文 NER 至关重要。
+- **中文 0.973**：略高于 Part 2 CRF（≈**0.95**），在 BMES 细粒度标签下仍保持高召回，体现 BERT 字/词级语义与手写 CRF 全局解码的互补。
+- CRF 层的作用不变：抑制非法 BIO/BMES 转移；与 Part 3 的差异主要在 **发射质量**（BERT hidden → Linear），而非解码公式本身。
+- 代价：模型体积与单步推理时延显著高于 Part 2/3；训练依赖 GPU 与预训练权重缓存，不适合作为 Part 3「从零 Transformer」的必做项，但作为 **预训练 + 结构化输出** 的上限对照很有价值。
+
+### 4.4 仅解码（面试 / 测试集）
+
+```bash
+python task3_transformer_crf/bert_crf_ner.py \
+  --ckpt-path task3_transformer_crf/checkpoints_bert/English_bert_crf.pt \
+  --input-path NER/English/validation.txt \
+  --output-path NER/predictions/bert_crf/English_validation_bert_crf.txt
+```
+
+仓库根目录亦提供一键评测脚本 `run_test_eval.py`（`pj2_test` 彩排 + 四路线 F1 汇总），Task4 对应 BERT+CRF 推理。
 
 ## Bonus：基于 `template_for_crf.utf8` 的模板特征 CRF（中文）
 
@@ -203,20 +283,21 @@ cd NER
 python -c "from check import check; check(language='Chinese', gold_path=r'Chinese/validation.txt', my_path=r'predictions/bonus_template_crf/Chinese_validation_bonus_template_crf.txt')"
 ```
 
-## 三部分对比与总结
+## 四部分对比与总结
 
 | 方法 | English micro-F1（验证集） | Chinese micro-F1（验证集） | 训练开销 |
 |------|---------------------------|---------------------------|----------|
 | HMM（Part 1，调平滑） | ≈ 0.79 | ≈ 0.89 | 极低，CPU |
 | CRF（Part 2，调 c1/c2） | ≈ **0.89** | ≈ **0.95** | 中，CPU |
 | Transformer+CRF（Part 3，12 epoch + 验证选优） | **0.605** | **0.803** | 高，GPU（约 12 epoch×2 语料） |
+| **BERT+CRF（Part 4，5 epoch + 验证选优）** | **0.929** | **0.973** | 高，GPU + 预训练依赖 |
 
 **结论**：
 
-1. **CRF + 手工特征** 在本数据上仍是上限最高的方案；面试与实验文档可重点对比「判别式特征」与「神经网络发射 + 结构化解码」的差异。
-2. **HMM** 作为生成式基线，英文仍优于本次 Part 3 英文（0.605），差距较「末轮无验证选优」时缩小，但瓶颈仍在**表示与优化**，而非解码头公式本身。
-3. **Transformer+手写 CRF** 在中文上验证了端到端训练可行性；英文在验证选优后可达约 **0.60**，继续提升仍依赖更小 batch、早停或预训练编码器。Part 1/2 已通过批量实验给出超参曲线；Part 3 以单次完整训练记录为主。
-4. **Bonus**：在仅使用 `template_for_crf.utf8` 的 20 组观测模板、不加 Part 2 手工特征的前提下，中文验证 **micro-F1≈0.951**，说明课堂分词式字窗模板对 **BMESO 中文 NER** 同样有效。
+1. **CRF + 手工特征**（Part 2）在本数据上仍是强基线；**BERT+CRF**（Part 4）在验证集上进一步超过 Part 2，说明预训练表示 + 同一套手写 CRF 可同时提升中英文上限。
+2. **HMM** 作为生成式基线，英文仍优于本次 Part 3 小 Transformer（0.605），但远低于 Part 4 BERT（0.929）；瓶颈在 **表示能力**，而非 CRF/Viterbi 解码形式。
+3. **Transformer+手写 CRF**（Part 3）在中文上验证了端到端训练可行性；英文在验证选优后约 **0.60**，继续提升需预训练编码器——Part 4 已给出对照结果。
+4. **Bonus**：在仅使用 `template_for_crf.utf8` 的 20 组观测模板、不加 Part 2 手工特征的前提下，中文验证 **micro-F1≈0.951**，说明课堂分词式字窗模板对 **BMESO 中文 NER** 同样有效；仍略低于 Part 4 BERT+CRF（0.973）。
 
 ## 附录：复现实验命令
 
@@ -232,6 +313,14 @@ CUDA_VISIBLE_DEVICES=3,4,5,6 torchrun --standalone --nproc_per_node=4 \
   pj2/part3/transformer_crf_ner.py \
   --lang both --batch-size 64 --num-workers 4 \
   --save-dir pj2/part3/checkpoints
+
+# Part 4：BERT + 手写 CRF（仓库根目录执行）
+CUDA_VISIBLE_DEVICES=0 python task3_transformer_crf/bert_crf_ner.py \
+  --lang both --epochs 5 --batch-size 8 \
+  --save-dir task3_transformer_crf/checkpoints_bert
+
+# pj2_test 四路线推理 + F1 汇总（含 BERT Task4）
+python run_test_eval.py --test-root pj2_test --device cuda --batch-size 32
 
 # Bonus：模板特征中文 CRF（写预测到 NER/predictions/bonus_template_crf/）
 python pj2/bonus/train_template_crf_chinese.py

@@ -22,6 +22,7 @@ task3_transformer_crf/checkpoints_bert/
 *_pred_task*.txt
 English_pred_*.txt
 Chinese_pred_*.txt
+pj2_test_predicion/
 
 # 本地 test 目录：仅保留说明，不提交从 validation 复制的 test.txt
 test/**/test.txt

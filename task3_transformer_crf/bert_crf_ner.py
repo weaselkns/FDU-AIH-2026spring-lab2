@@ -10,6 +10,7 @@ BERT + 手写线性链 CRF 的 NER
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -53,6 +54,46 @@ def default_bert_name(language: str) -> str:
     return DEFAULT_BERT[language]
 
 
+def _resolve_bert_path(bert_name: str) -> str:
+    """将 HF 模型 id 解析为本地目录（显式路径或 ~/.cache 快照），避免推理时访问外网。"""
+    p = Path(bert_name)
+    if p.is_dir():
+        return str(p.resolve())
+
+    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+    repo_dir = hf_home / "hub" / f"models--{bert_name.replace('/', '--')}" / "snapshots"
+    if repo_dir.is_dir():
+        snaps = sorted(repo_dir.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True)
+        if snaps:
+            return str(snaps[0].resolve())
+    return bert_name
+
+
+def load_pretrained_bert(bert_name: str) -> tuple[Any, Any]:
+    """
+    加载 HF BERT 与 tokenizer（仅本地，不访问 huggingface.co）。
+
+    ``.pt`` checkpoint 里只有 CRF+分类头等微调权重；推理时仍需同架构的 BERT 预训练骨架，
+    从本机 HF 缓存或 ``--bert-model`` 目录加载即可，不必重新训练。
+    """
+    local_path = _resolve_bert_path(bert_name)
+    load_kw = {"local_files_only": True}
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(local_path, use_fast=True, **load_kw)
+        bert = AutoModel.from_pretrained(local_path, **load_kw)
+    except Exception as e:
+        raise RuntimeError(
+            f"无法从本地加载 BERT「{bert_name}」（解析路径: {local_path}）。\n"
+            f"节点无外网时请先在有网环境缓存模型，或指定 --bert-model <本地目录>。\n"
+            f"原始错误: {e}"
+        ) from e
+    if local_path != bert_name:
+        print(f"[BERT] 离线加载: {bert_name} -> {local_path}")
+    else:
+        print(f"[BERT] 离线加载: {bert_name}")
+    return tokenizer, bert
+
+
 def first_subword_indices(word_ids: list[int | None], num_words: int) -> list[int]:
     """从 tokenizer.word_ids() 得到每个原词位置在 BERT 序列中的首子词下标。"""
     indices: list[int] = []
@@ -81,8 +122,7 @@ class BertCRFNER(nn.Module):
     ) -> None:
         super().__init__()
         self.bert_name = bert_name
-        self.tokenizer = AutoTokenizer.from_pretrained(bert_name, use_fast=True)
-        self.bert = AutoModel.from_pretrained(bert_name)
+        self.tokenizer, self.bert = load_pretrained_bert(bert_name)
         hidden = self.bert.config.hidden_size
         self.drop = nn.Dropout(dropout)
         self.classifier = nn.Linear(hidden, num_tags)
@@ -435,6 +475,7 @@ def predict_with_checkpoint(
     output_path: Path,
     device: torch.device,
     batch_size: int = 8,
+    bert_model: str = "",
 ) -> None:
     try:
         ck = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -445,7 +486,7 @@ def predict_with_checkpoint(
     tag_stoi = meta["tag_stoi"]
     tag_itos = meta["tag_itos"]
     max_words = int(meta["max_words"])
-    bert_name = meta.get("bert_name") or default_bert_name(language)
+    bert_name = bert_model or meta.get("bert_name") or default_bert_name(language)
 
     transition_allow = None
     if meta.get("use_bio_mask"):
